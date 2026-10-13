@@ -24,6 +24,7 @@ Pure standard library. Single file. Python 3.7+. No dependencies.
 - **Interprets, not just dumps** — honest **member vs. Domain Controller** classification (a DC is only claimed when a DC service actually answers), and a security-posture read (SMB/LDAP signing, EPA/channel-binding, NTLMv1/LM weak crypto).
 - **Recovers the internal IP** — the one thing NTLM itself can't give you — via IIS Host-header disclosure (CVE-2000-0649), WebDAV PROPFIND, RPC `IOXIDResolver::ServerAlive2` (TCP 135), and TLS/RDP certificate IP SANs.
 - **Extra disclosures** — TLS/RDP certificate CN + SANs, Exchange `X-FEServer`/`X-CalculatedBETarget` header leaks, and anonymous **LDAP rootDSE** enrichment (naming contexts, `dnsHostName`, AD functional levels).
+- **No wordlist false positives** — random "canary" paths detect hosts that challenge *every* path (site-wide IIS Windows Auth, or an ADC / reverse proxy in front of the app) and collapse the wordlist noise to a single, honest finding. If every canary is dropped by a slow or throttling host the guard falls back on the wordlist hit ratio rather than failing open, and the report says which signal decided it.
 - **Fast** — a port-liveness gate skips every probe on a closed port, so filtered hosts don't cost you a wall of timeouts.
 - **Lockout-safe spray mode** — password-spray ordering (one password across all users per round), NTLM Type-3 or HTTP Basic against the most effective endpoint, with a clear valid / invalid / inconclusive verdict.
 - **Report-ready output** — grouped per-host summary plus JSON, NDJSON, CSV, and a NetExec-style hosts file. Output files are written with owner-only permissions.
@@ -37,6 +38,12 @@ python3 ntlmscout.py --help
 ```
 
 No `pip install`, no virtualenv — it only uses the Python standard library.
+
+## Tests
+
+```bash
+python3 -m unittest test_ntlmscout
+```
 
 ## Usage
 
@@ -58,6 +65,32 @@ python3 ntlmscout.py --spray -I hosts.txt -u users.txt -p 'Winter2026!' --delay 
 ```
 
 Recon is a **full sweep by default**. Trim it with `--no-discover` (skip the HTTP path wordlist) or `--no-internal-ip` (skip the cert/OXID/IIS checks). See `--help` for the full menu.
+
+### Scan cost
+
+A full sweep is not cheap per host, so the size of a range matters more than it
+looks. One bare host fans out to **376 probes** by default: 23 NTLM-capable
+ports, 6 of them web ports multiplied by the 83-entry HTTP path wordlist, plus
+the internal-disclosure checks and the catch-all canaries per web endpoint. The
+scope flags change that sharply.
+
+| Flags | Probes per host | A /24 | A /16 |
+|---|---|---|---|
+| default | 376 | 95,504 | 24,640,784 |
+| `--no-discover` | 40 | 10,160 | 2,621,360 |
+| `--no-discover --no-internal-ip` | 23 | 5,842 | 1,507,282 |
+
+Closed ports are pruned with one fast connect per `host:port` before any probe
+runs, so the live probe count on a real network is usually far lower. The
+planner streams in batches and never holds the whole plan in memory, so peak
+memory tracks `--threads`, not the size of the range.
+
+A **probe budget** guards against a run that would take days by accident:
+ntlmscout refuses to start if the plan exceeds `--max-jobs` probes (500,000 by
+default) and tells you which flag to reach for. Raise it deliberately with
+`--max-jobs N`, or `--max-jobs 0` for no limit. Note that results for every
+probe are held in memory until the scan ends, so a very large `--max-jobs` still
+costs memory over a long run; prefer splitting the range.
 
 ## Example output
 

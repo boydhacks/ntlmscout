@@ -101,28 +101,51 @@ def _proxy_url():
     return "http://%s:%d" % _PROXY if _PROXY else None
 
 
-_CIDR_MAX = 65536  # don't expand networks larger than this (guards huge v4/v6 ranges)
+# Planning budget.  What exhausts memory is not the address count but the
+# post-fan-out *probe* count: one bare host fans out to ~368 probes by default
+# (23 ports, 6 of them web x the HTTP path wordlist, plus the internal-address
+# disclosure checks), so a /16 projects to ~24M probes.  Planning is streamed in
+# batches (see iter_job_batches), so the plan no longer has to fit in memory;
+# this budget refuses runs whose result set and runtime would be absurd anyway.
+_MAX_JOBS = 500000          # override with --max-jobs (0 = unlimited)
+
+
+def _as_network(t):
+    """Parse a bare CIDR token into an ip_network, or None if it isn't one."""
+    if "://" in t or "/" not in t or t.startswith("["):
+        return None
+    try:
+        return ipaddress.ip_network(t, strict=False)
+    except ValueError:
+        return None
+
+
+def _host_count(t):
+    """How many hosts a target token expands to, without enumerating them."""
+    net = _as_network(t)
+    if net is None:
+        return 1
+    n = net.num_addresses
+    if n <= 2:                                   # /31, /32 and v6 equivalents
+        return n
+    return n - 1 if net.version == 6 else n - 2  # .hosts() drops network/broadcast
 
 
 def _expand_targets(raw):
-    """Expand any bare CIDR entries (e.g. 10.0.0.0/24, 2001:db8::/120) into host IPs."""
-    out = []
+    """Expand any bare CIDR entries (e.g. 10.0.0.0/24, 2001:db8::/120) into host
+    IPs.  A generator: a large prefix is never materialized as a list."""
     for t in raw:
-        if "://" not in t and "/" in t and not t.startswith("["):
-            try:
-                net = ipaddress.ip_network(t, strict=False)
-            except ValueError:
-                out.append(t)
-                continue
-            if net.num_addresses > _CIDR_MAX:
-                sys.stderr.write("[!] skipping %s -- range too large to expand "
-                                 "(> %d addresses)\n" % (t, _CIDR_MAX))
-                continue
-            hosts = [str(ip) for ip in net.hosts()] or [str(ip) for ip in net]
-            out.extend(hosts)
-        else:
-            out.append(t)
-    return out
+        net = _as_network(t)
+        if net is None:
+            yield t
+            continue
+        empty = True
+        for ip in net.hosts():
+            empty = False
+            yield str(ip)
+        if empty:                                # nets whose .hosts() is empty
+            for ip in net:
+                yield str(ip)
 
 
 def _split_host_port(token):
@@ -588,14 +611,20 @@ def http_challenge(url, host_header=None, timeout=10):
 
 
 def http_probe(url, host_header=None, timeout=10):
-    """Return (ntlm_blob_or_None, {name_headers}, {info_headers})."""
+    """Return (ntlm_blob_or_None, {name_headers}, {info_headers}, responded).
+
+    ``responded`` is False only when the request never got an HTTP response at
+    all -- timeout, reset, TLS failure, rate-limit drop. A 401/404/200 without a
+    challenge *is* an answer and reports True. That distinction is what lets the
+    catch-all guard tell "this path is not protected" apart from "we never found
+    out", instead of treating both as proof the host is path-specific."""
     headers = _http_fetch(url, host_header, timeout)
-    if not headers:
-        return None, {}, {}
+    if headers is None:
+        return None, {}, {}, False
     blob = _ntlm_from_headers(headers)
     names = {k: headers.get(k) for k in _EXCHANGE_NAME_HDRS if headers.get(k)}
     info = {k: headers.get(k) for k in _EXCHANGE_INFO_HDRS if headers.get(k)}
-    return blob, names, info
+    return blob, names, info, True
 
 
 # ---- Line-based SASL: SMTP / IMAP / POP3 / NNTP ---------------------------
@@ -1171,6 +1200,40 @@ HTTP_PATHS = _normalize_paths(_HTTP_PATHS_RAW)
 
 
 # ---------------------------------------------------------------------------
+#  Catch-all (path-agnostic) NTLM detection
+#
+#  A site that enforces NTLM on *every* path -- an IIS site-wide Windows Auth
+#  filter, or an ADC / reverse proxy in front of the app -- answers the whole
+#  endpoint wordlist with a challenge, so the "discovered" endpoints are just
+#  the wordlist enumerating itself. We probe one random, cannot-exist path (a
+#  canary); if it also challenges, the host is a site-wide auth gate and its
+#  per-path hits are collapsed to a single, honest finding.
+# ---------------------------------------------------------------------------
+CANARY_MARKER = "/_ntlmscout_canary_"
+
+# More than one canary per endpoint: the guard should not hinge on a single
+# request surviving a host that is slow, throttling, or dropping connections
+# under the probe load.
+CANARY_PROBES = 2
+
+# Fallback for when every canary died. A host that challenges nearly every path
+# it actually answered is a site-wide gate whether or not the canary got through.
+# The sample floor keeps a two-hit host from collapsing on a 100% ratio.
+CATCHALL_MIN_SAMPLE = 10
+CATCHALL_HIT_RATIO = 0.9
+
+
+def canary_path():
+    """A random path that cannot correspond to a real application endpoint."""
+    return "{}{}/".format(CANARY_MARKER, uuid.uuid4().hex)
+
+
+def is_canary_result(result):
+    """True if this result came from the synthetic canary probe."""
+    return CANARY_MARKER in (result.get("url") or "")
+
+
+# ---------------------------------------------------------------------------
 #  Internal-address disclosure modules (passive; no auth / no relay)
 #
 #  The NTLM CHALLENGE never carries an IP, but two well-known unauthenticated
@@ -1600,6 +1663,11 @@ def probe(proto, host, port=None, url=None, host_header=None, timeout=10):
         return probe_tlscert(host, port or 3389, timeout, rdp=True)
     result = {"target": url or "{}:{}".format(host, port or ""), "protocol": proto,
               "host": host, "port": port, "url": url, "success": False}
+    if proto in ("http", "https"):
+        # Overwritten once the fetch returns; staying False means the probe
+        # never reached the server, which the catch-all guard treats as "no
+        # evidence" rather than as evidence of path-specific auth.
+        result["responded"] = False
     t0 = time.time()
     try:
         exch_names, exch_info = {}, {}
@@ -1607,7 +1675,8 @@ def probe(proto, host, port=None, url=None, host_header=None, timeout=10):
             if not url:
                 p = port or (443 if proto == "https" else 80)
                 url = "{}://{}:{}/".format(proto, _url_host(host), p)
-            raw, exch_names, exch_info = http_probe(url, host_header, timeout)
+            raw, exch_names, exch_info, responded = http_probe(url, host_header, timeout)
+            result["responded"] = responded
         else:
             raw = run_protocol(proto, host, port, url, host_header, timeout)
         if not raw:
@@ -1782,45 +1851,106 @@ def _discover_on(args):
     return not getattr(args, "no_discover", False)
 
 
-def plan_targets(args):
-    """Expand targets (hosts/URLs/-iL) into the list of (proto, host, port, url) probes."""
-    raw_targets = list(args.targets)
+def _iter_raw_targets(args):
+    """Yield raw target tokens from the command line and -I file, lazily."""
+    for t in args.targets:
+        yield t
     if args.input_list:
         with open(args.input_list) as fh:
             for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    raw_targets.append(line)
-    raw_targets = _expand_targets(raw_targets)
+                    yield line
+
+
+# Canonical TLS port per protocol, for the cert-disclosure jobs below.
+_TLS_DEFAULT_PORT = {"https": 443, "ldaps": 636, "imaps": 993, "pop3s": 995,
+                     "smtps": 465, "nntps": 563}
+
+
+def _internal_disclosure_jobs(jobs):
+    """Internal-address disclosure jobs for one host's probe list (on by default):
+         * iisip   : one per unique http(s) endpoint (Host-header + PROPFIND)
+         * tlscert : one per unique TLS endpoint (cert CN/SAN names + IPs)
+         * rdpcert : one per unique RDP endpoint (CredSSP cert CN)
+         * oxid    : one per unique host (RPC ServerAlive2 / 135)"""
+    http_seen, tls_seen, host_seen, extra = set(), set(), set(), []
+    for (proto, host, port, url) in jobs:
+        if proto in ("http", "https"):
+            p = port or (443 if proto == "https" else 80)
+            if ("iisip", host, p) not in http_seen:
+                http_seen.add(("iisip", host, p))
+                extra.append(("iisip", host, p, "{}://{}:{}".format(proto, _url_host(host), p)))
+        if proto in _TLS_DEFAULT_PORT:
+            p = port or _TLS_DEFAULT_PORT[proto]
+            if (host, p) not in tls_seen:
+                tls_seen.add((host, p))
+                extra.append(("tlscert", host, p, None))
+        elif proto == "rdp":
+            p = port or 3389
+            if (host, p) not in tls_seen:
+                tls_seen.add((host, p))
+                extra.append(("rdpcert", host, p, None))
+    for (proto, host, port, url) in jobs:
+        if host not in host_seen:
+            host_seen.add(host)
+            extra.append(("oxid", host, 135, None))
+    return extra
+
+
+def _canary_jobs(jobs):
+    """One canary per HTTP(S) endpoint in this host's probe list: a random path
+    that cannot exist.  If it returns an NTLM challenge the host challenges
+    every path, which is what collapse_catchall_endpoints() keys off.  WinRM is
+    a single-path service, so the wordlist -- and the canary -- don't apply."""
+    canary_seen, extra = set(), []
+    for (proto, host, port, url) in jobs:
+        if proto not in ("http", "https") or not url:
+            continue
+        if _job_port(proto, port) in _WINRM_PORTS:
+            continue
+        key = (proto, host, _job_port(proto, port))
+        if key in canary_seen:
+            continue
+        canary_seen.add(key)
+        scheme, rest = url.split("://", 1)
+        origin = "{}://{}".format(scheme, rest.split("/", 1)[0])
+        for _ in range(CANARY_PROBES):
+            extra.append((proto, host, port, origin + canary_path()))
+    return extra
+
+
+def _plan_token(t, args):
+    """Every (proto, host, port, url) probe for a single target token, including
+    that host's internal-disclosure jobs.  This is the unit the planner streams."""
     discover = _discover_on(args)
     jobs = []
-    for t in raw_targets:
-        if "://" in t:
-            scheme = t.split("://", 1)[0].lower()
-            rest = t.split("://", 1)[1]
-            hostport = rest.split("/", 1)[0]
-            host, port = _split_host_port(hostport)
-            path_part = rest[len(hostport):]           # includes leading '/', if any
-            has_path = path_part not in ("", "/")
-            if scheme in ("http", "https"):
-                # A URL targeting the site root fans out over the path wordlist;
-                # a specific path (e.g. /ews/) is a single, deliberate probe.
-                if discover and not has_path:
-                    for p in HTTP_PATHS:
-                        jobs.append((scheme, host, port,
-                                     "{}://{}{}".format(scheme, hostport, p)))
-                else:
-                    jobs.append((scheme, host, port, t))
-            elif scheme == "smb":
-                jobs.append(("smb", host, port or 445, None))
-            elif scheme == "mssql":
-                jobs.append(("mssql", host, port or 1433, None))
-            elif scheme in ("smtp", "smtps", "imap", "imaps", "pop3", "pop3s",
-                            "nntp", "nntps", "ldap", "ldaps", "rdp"):
-                jobs.append((scheme, host, port, None))
+    if "://" in t:
+        scheme = t.split("://", 1)[0].lower()
+        rest = t.split("://", 1)[1]
+        hostport = rest.split("/", 1)[0]
+        host, port = _split_host_port(hostport)
+        path_part = rest[len(hostport):]           # includes leading '/', if any
+        has_path = path_part not in ("", "/")
+        if scheme in ("http", "https"):
+            # A URL targeting the site root fans out over the path wordlist;
+            # a specific path (e.g. /ews/) is a single, deliberate probe.
+            if discover and not has_path:
+                for p in HTTP_PATHS:
+                    jobs.append((scheme, host, port,
+                                 "{}://{}{}".format(scheme, hostport, p)))
             else:
                 jobs.append((scheme, host, port, t))
-            continue
+        elif scheme == "smb":
+            jobs.append(("smb", host, port or 445, None))
+        elif scheme == "mssql":
+            jobs.append(("mssql", host, port or 1433, None))
+        elif scheme in ("smtp", "smtps", "imap", "imaps", "pop3", "pop3s",
+                        "nntp", "nntps", "ldap", "ldaps", "rdp"):
+            jobs.append((scheme, host, port, None))
+        else:
+            jobs.append((scheme, host, port, t))
+    else:
         host, port = _split_host_port(t)
         if port:
             # A specific host:port -> probe just that service.
@@ -1829,38 +1959,135 @@ def plan_targets(args):
             # Bare host -> full sweep of every known NTLM port/protocol.
             for p, proto in sorted(PORT_PROTOCOL.items()):
                 _add_host(jobs, proto, host, p, args)
-
-    # Internal-disclosure jobs (on by default):
-    #   * iisip   : one per unique http(s) endpoint (Host-header + PROPFIND)
-    #   * tlscert : one per unique TLS endpoint (cert CN/SAN names + IPs)
-    #   * rdpcert : one per unique RDP endpoint (CredSSP cert CN)
-    #   * oxid    : one per unique host (RPC ServerAlive2 / 135)
-    _TLS_DEFAULT_PORT = {"https": 443, "ldaps": 636, "imaps": 993, "pop3s": 995,
-                         "smtps": 465, "nntps": 563}
+    if discover:
+        jobs += _canary_jobs(jobs)
     if not getattr(args, "no_internal_ip", False):
-        http_seen, tls_seen, host_seen, extra = set(), set(), set(), []
-        for (proto, host, port, url) in jobs:
-            if proto in ("http", "https"):
-                p = port or (443 if proto == "https" else 80)
-                if ("iisip", host, p) not in http_seen:
-                    http_seen.add(("iisip", host, p))
-                    extra.append(("iisip", host, p, "{}://{}:{}".format(proto, _url_host(host), p)))
-            if proto in _TLS_DEFAULT_PORT:
-                p = port or _TLS_DEFAULT_PORT[proto]
-                if (host, p) not in tls_seen:
-                    tls_seen.add((host, p))
-                    extra.append(("tlscert", host, p, None))
-            elif proto == "rdp":
-                p = port or 3389
-                if (host, p) not in tls_seen:
-                    tls_seen.add((host, p))
-                    extra.append(("rdpcert", host, p, None))
-        for (proto, host, port, url) in jobs:
-            if host not in host_seen:
-                host_seen.add(host)
-                extra.append(("oxid", host, 135, None))
-        jobs += extra
+        jobs += _internal_disclosure_jobs(jobs)
     return jobs
+
+
+def _unique_raw_targets(args):
+    """Raw target tokens with repeats dropped.  Deduping happens *before* CIDR
+    expansion on purpose: expanding a prefix already yields each address once,
+    so the set stays bounded by the size of the target list rather than growing
+    with the size of the range."""
+    seen = set()
+    for t in _iter_raw_targets(args):
+        if t not in seen:
+            seen.add(t)
+            yield t
+
+
+def iter_job_groups(args):
+    """Stream the plan one target at a time, so no scan has to hold its whole
+    job list in memory."""
+    for t in _expand_targets(_unique_raw_targets(args)):
+        group = _plan_token(t, args)
+        if group:
+            yield group
+
+
+_PLAN_BATCH = 20000     # probes planned, port-checked and submitted at a time
+
+
+def iter_job_batches(args, size=_PLAN_BATCH):
+    """Stream the plan in batches of roughly `size` probes, never splitting one
+    target's jobs across batches -- prune_closed_ports() dedupes within a batch,
+    so keeping a host whole keeps it to one connect per host:port."""
+    batch = []
+    for group in iter_job_groups(args):
+        batch.extend(group)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def plan_targets(args):
+    """The whole plan as a single list.  Materializes every probe -- callers
+    scanning more than a handful of hosts should use iter_job_batches()."""
+    jobs = []
+    for group in iter_job_groups(args):
+        jobs.extend(group)
+    return jobs
+
+
+# --- Planning budget -------------------------------------------------------
+# The plan is streamed, so its size no longer has to fit in memory, but a run
+# that would issue tens of millions of probes is still almost always a mistake.
+# The budget counts *probes*, not addresses, because the per-host fan-out swings
+# ~16x with --no-discover / --no-internal-ip and grows every time a path is added
+# to HTTP_PATHS.  Fan-out is measured, not hardcoded, so it can't drift.
+_FANOUT_CACHE = {}
+
+
+def _fanout(token, args):
+    """Probes a token of this shape generates, measured by planning a dummy."""
+    key = (token, _discover_on(args), bool(getattr(args, "no_internal_ip", False)))
+    if key not in _FANOUT_CACHE:
+        _FANOUT_CACHE[key] = len(_plan_token(token, args))
+    return _FANOUT_CACHE[key]
+
+
+def _shape_of(t):
+    """A dummy token with the same fan-out as `t` -- one per distinct shape, so
+    the measurement is cached across a target list of any length."""
+    net = _as_network(t)
+    if net is not None:
+        return "0.0.0.0"                       # CIDR -> bare hosts
+    if "://" in t:
+        scheme, rest = t.split("://", 1)
+        hostport = rest.split("/", 1)[0]
+        path = rest[len(hostport):]
+        return "%s://0.0.0.0%s" % (scheme.lower(), "/" if path in ("", "/") else "/x")
+    _host, port = _split_host_port(t)
+    return "0.0.0.0:%d" % port if port else "0.0.0.0"
+
+
+def project_plan(args, max_jobs=None, per_target=None):
+    """Count hosts and projected probes *before* planning anything.
+
+    Returns (hosts, probes), or (None, None) after explaining the refusal when
+    the projection exceeds the budget.  `per_target` overrides the measured
+    fan-out (spray resolves one endpoint per target, so it passes 1)."""
+    if max_jobs is None:
+        max_jobs = getattr(args, "max_jobs", _MAX_JOBS)
+    hosts = probes = 0
+    for t in _unique_raw_targets(args):
+        n = _host_count(t)
+        hosts += n
+        probes += n * (per_target if per_target is not None
+                       else _fanout(_shape_of(t), args))
+    if max_jobs and probes > max_jobs:
+        sys.stderr.write(
+            "[!] refusing to plan {:,} probe(s) across {:,} host(s) -- the budget "
+            "is {:,}.\n".format(probes, hosts, max_jobs))
+        if per_target is None:
+            sys.stderr.write("[!] that is {:,} probe(s) per host at these flags. "
+                             "Options:\n".format(probes // max(hosts, 1)))
+            sys.stderr.write("[!]   --no-discover      skip the HTTP path wordlist "
+                             "(~9x fewer probes)\n")
+            sys.stderr.write("[!]   --no-internal-ip   skip the cert / OXID / IIS "
+                             "disclosure probes\n")
+        else:
+            sys.stderr.write("[!] spray resolves one endpoint per target. Options:\n")
+        sys.stderr.write("[!]   --max-jobs N       raise the budget deliberately "
+                         "(0 = unlimited)\n")
+        sys.stderr.write("[!]   or split the range into smaller prefixes\n")
+        return None, None
+    return hosts, probes
+
+
+class _DefaultScope(object):
+    """Stand-in args for measuring the default per-host fan-out, for --help."""
+    no_discover = False
+    no_internal_ip = False
+
+
+def _bare_host_probes():
+    """How many probes one bare host costs with default flags."""
+    return _fanout("0.0.0.0", _DefaultScope())
 
 
 _WINRM_PORTS = {5985, 5986}
@@ -2000,6 +2227,101 @@ def _fp_score(r):
     return len([v for v in r.get("fingerprint", {}).values() if v not in (None, "")])
 
 
+def _endpoint_key(r):
+    """(protocol, host, port) identity for an endpoint, with defaults resolved."""
+    return (r.get("protocol"), r.get("host"), _job_port(r.get("protocol"), r.get("port")))
+
+
+def _url_path(url):
+    """Path portion of a URL ('/' when there is none)."""
+    rest = url.split("://", 1)[-1]
+    return rest[rest.find("/"):] if "/" in rest else "/"
+
+
+def _catchall_representative(rs):
+    """The single endpoint to keep for a catch-all host: the site root when
+    present, otherwise the richest fingerprint, otherwise the first."""
+    for r in rs:
+        if _url_path(r.get("url") or "") == "/":
+            return r
+    return max(rs, key=_fp_score)
+
+
+def _canary_verdict(canaries):
+    """What this endpoint's canary probes actually proved.
+
+    ``catchall`` -- a canary was challenged on a path that cannot exist.
+    ``specific`` -- a canary reached the server and was not challenged, so auth
+                    really is per-path.
+    ``unknown``  -- every canary failed to reach the server, so the guard learned
+                    nothing. Treating that as ``specific`` is what made a single
+                    timed-out request silently re-expose the whole wordlist.
+    """
+    reached = False
+    for r in canaries:
+        if r.get("ntlm"):
+            return "catchall"
+        if r.get("responded", True):
+            reached = True
+    return "specific" if reached else "unknown"
+
+
+def collapse_catchall_endpoints(results):
+    """Collapse site-wide (path-agnostic) NTLM auth to one endpoint per host.
+
+    A canary probe that returns an NTLM challenge proves the host challenges
+    every path, so its wordlist hits are false positives. When every canary for
+    an endpoint failed to reach the server the verdict is ``unknown``, and the
+    hit ratio over the paths that *did* answer decides instead -- otherwise one
+    dropped request silently re-exposes the whole wordlist as findings.
+
+    The canary results are dropped; for each affected (protocol, host, port)
+    group one representative keeps its challenge (tagged ``catchall``, plus
+    ``catchall_inferred`` when the ratio decided it) while the rest stay in the
+    list for their disclosed names / addresses but no longer count as endpoints.
+
+    Mutates ``results`` in place and returns the filtered list.
+    """
+    canaries, answered, hits = {}, {}, {}
+    out, groups = [], OrderedDict()
+    for r in results:
+        key = _endpoint_key(r)
+        if is_canary_result(r):
+            canaries.setdefault(key, []).append(r)
+            continue                   # synthetic path -- never an endpoint
+        out.append(r)
+        if r.get("protocol") not in ("http", "https"):
+            continue
+        if r.get("responded", True):
+            answered[key] = answered.get(key, 0) + 1
+            if r.get("ntlm"):
+                hits[key] = hits.get(key, 0) + 1
+        if r.get("ntlm"):
+            groups.setdefault(key, []).append(r)
+
+    for key, rs in groups.items():
+        verdict = _canary_verdict(canaries.get(key, []))
+        inferred = False
+        if verdict == "unknown":
+            # No canary survived. Fall back on the shape of the wordlist run
+            # itself, which costs no extra request and cannot time out.
+            n = answered.get(key, 0)
+            if n >= CATCHALL_MIN_SAMPLE and hits.get(key, 0) >= n * CATCHALL_HIT_RATIO:
+                verdict, inferred = "catchall", True
+        if verdict != "catchall":
+            continue
+        rep = _catchall_representative(rs)
+        for r in rs:
+            r["catchall"] = True
+            if inferred:
+                r["catchall_inferred"] = True
+            if r is rep:
+                r["catchall_collapsed"] = len(rs)
+            else:
+                r["ntlm"] = None
+    return out
+
+
 def print_host_summaries(results, roles=None, out=sys.stdout, full=False):
     """Per-host summary block.
 
@@ -2096,6 +2418,18 @@ def print_host_summaries(results, roles=None, out=sys.stdout, full=False):
             out.write(_color(row, C_RED, use_color) + "\n")
             for e in eps:
                 out.write("      - {}\n".format(e))
+            if any(r.get("catchall") for r in rs):
+                n = max((r.get("catchall_collapsed") or 0)
+                        for r in rs if r.get("catchall"))
+                # Say which signal decided it: a canary that came back, or the
+                # hit ratio standing in because none of them did.
+                basis = ("inferred from hit ratio, canary unreachable"
+                         if any(r.get("catchall_inferred") for r in rs)
+                         else "canary confirmed")
+                out.write(_color(
+                    "      (site-wide NTLM auth -- path-agnostic; {} wordlist "
+                    "path(s) collapsed; {})".format(n, basis),
+                    C_YELLOW, use_color) + "\n")
     out.write("=" * 72 + "\n")
 
 
@@ -2409,19 +2743,20 @@ def run_spray(args):
     if not users or not passwords:
         sys.stderr.write("[!] spray mode requires users (-u) and passwords (-p)\n")
         return 2
-    targets = list(args.targets)
-    if args.input_list:
-        with open(args.input_list) as fh:
-            targets += [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-    targets = _expand_targets(targets)
-    if not targets:
+    # Spray resolves exactly one endpoint per target, so the budget counts one
+    # probe per host rather than the recon fan-out.
+    n_targets, _ = project_plan(args, per_target=1)
+    if n_targets is None:
+        return 2
+    if not n_targets:
         sys.stderr.write("[!] no targets given\n")
         return 2
 
-    # Resolve one spray endpoint per target.
-    sys.stderr.write("[*] Resolving spray endpoints across %d target(s)...\n" % len(targets))
+    # Resolve one spray endpoint per target.  Targets are expanded lazily so a
+    # large prefix is never held as a list.
+    sys.stderr.write("[*] Resolving spray endpoints across %d target(s)...\n" % n_targets)
     endpoints = []  # (host, port, use_tls, path, domain)
-    for t in targets:
+    for t in _expand_targets(_iter_raw_targets(args)):
         host, port, use_tls, path = _spray_target_parts(t)
         ep, dom = pick_spray_endpoint(host, port, use_tls, args.auth, args.timeout,
                                       forced_path=path or args.spray_path)
@@ -2565,10 +2900,19 @@ def build_arg_parser():
 
     scope = ap.add_argument_group("recon scope (default: full sweep of all ports)")
     scope.add_argument("--no-discover", action="store_true",
-                       help="skip the HTTP path wordlist; probe site roots only")
+                       help="skip the HTTP path wordlist; probe site roots only "
+                            "(~9x fewer probes per host)")
     scope.add_argument("--no-internal-ip", action="store_true",
                        help="skip internal-disclosure checks (IIS Host-header/PROPFIND, "
-                            "TLS+RDP cert names, Exchange FE/BE headers, RPC OXID/135)")
+                            "TLS+RDP cert names, Exchange FE/BE headers, RPC OXID/135) "
+                            "(~2x fewer probes per host)")
+    scope.add_argument("--max-jobs", type=int, default=_MAX_JOBS, metavar="N",
+                       help="refuse to start if the plan exceeds N probes "
+                            "(default %d; 0 = unlimited). A bare host costs %d "
+                            "probes at default flags, so a /24 is ~%d and a /16 "
+                            "is ~%d -- check this before scanning a large prefix."
+                            % (_MAX_JOBS, _bare_host_probes(),
+                               254 * _bare_host_probes(), 65534 * _bare_host_probes()))
 
     spray = ap.add_argument_group("spray mode")
     spray.add_argument("--spray", action="store_true",
@@ -2622,24 +2966,39 @@ def run_recon(args):
     (HTTP/S + wordlist, SMB, all mail, LDAP/GC, MSSQL, RDP, NNTP) plus the
     internal-disclosure modules; decode every challenge and report.
     --no-discover trims the HTTP wordlist; --no-internal-ip drops cert/OXID/IIS."""
-    jobs = plan_targets(args)
-    planned = len(jobs)
-    hosts = len({j[1] for j in jobs})
-    ports = len({(j[1], _job_port(j[0], j[2])) for j in jobs})
+    hosts, projected = project_plan(args)
+    if hosts is None:
+        return 2
+    if not hosts:
+        sys.stderr.write("[!] no targets to scan\n")
+        return 2
     # Config line first, so the user sees activity before the (silent) port check.
     if not args.quiet:
-        sys.stderr.write("[*] recon  ·  %d host(s)  ·  %d threads  ·  %gs timeout  ·  proxy %s\n"
-                         % (hosts, args.threads, args.timeout, "on" if _PROXY else "off"))
-        sys.stderr.write("[*] checking %d host:port(s) for open services ...\n" % ports)
-    # Skip everything on closed ports (one fast connect per host:port) -- avoids
-    # the per-probe timeouts that dominate scan time on filtered hosts.
-    jobs, closed = prune_closed_ports(jobs, args.timeout, args.threads)
-    total = len(jobs)
-    if not args.quiet:
-        if closed:
-            sys.stderr.write("[*] %d closed port(s) skipped  ·  %d/%d probes live\n"
-                             % (closed, total, planned))
-        sys.stderr.write("[*] scouting exposed NTLM, please stand by ...\n")
+        sys.stderr.write("[*] recon  ·  %d host(s)  ·  ~%d probe(s)  ·  %d threads  ·  "
+                         "%gs timeout  ·  proxy %s\n"
+                         % (hosts, projected, args.threads, args.timeout,
+                            "on" if _PROXY else "off"))
+
+    # The plan is streamed in batches rather than built up front, so peak memory
+    # tracks concurrency instead of target count.  Look one batch ahead: when the
+    # whole scan fits in a single batch (the common case) the exact totals are
+    # known and progress reports them as before.
+    batches = iter_job_batches(args)
+    first = next(batches, None)
+    if first is None:
+        sys.stderr.write("[!] no probes planned for the given target(s)\n")
+        return 2
+    second = next(batches, None)
+    single = second is None
+    # Held in a list so each batch is released as soon as it is handed over.
+    head = [first] if single else [first, second]
+    del first, second
+
+    def _stream():
+        while head:
+            yield head.pop(0)
+        for b in batches:
+            yield b
 
     # Live in-place progress on an interactive terminal (not when piped/quiet/-v).
     show_progress = (not args.quiet) and (not args.verbose) and _use_color(sys.stderr)
@@ -2649,36 +3008,68 @@ def run_recon(args):
             sys.stderr.write("\r\033[K"); sys.stderr.flush()
 
     results = []
-    done = 0
+    announced = set()
+    done = planned = total = closed_total = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futs = {ex.submit(probe, proto, host, port, url, None, args.timeout): (proto, host)
-                for (proto, host, port, url) in jobs}
-        announced = set()
-        for fut in concurrent.futures.as_completed(futs):
-            r = fut.result()
-            results.append(r)
-            done += 1
-            if args.quiet:
-                continue
-            if args.verbose:
-                # Full live detail: every endpoint / probe.
-                if r.get("success"):
-                    print(fmt_text(r)); print()
+        for batch_no, batch in enumerate(_stream()):
+            planned += len(batch)
+            # Skip everything on closed ports (one fast connect per host:port) --
+            # avoids the per-probe timeouts that dominate scan time on filtered
+            # hosts.  A batch holds whole hosts, so this still dedupes per host.
+            if not args.quiet and batch_no == 0:
+                if single:
+                    ports = len({(j[1], _job_port(j[0], j[2])) for j in batch})
+                    sys.stderr.write("[*] checking %d host:port(s) for open services ...\n"
+                                     % ports)
                 else:
-                    print(fmt_text(r))
-            elif (r.get("success") and r["host"] not in announced
-                  and (r.get("fingerprint") or r.get("internal_addresses"))):
-                # Default: one concise line the first time a host is confirmed
-                # (name-only cert hits don't warrant a live line).
-                announced.add(r["host"])
-                _clear_progress()
-                print(host_line(r)); sys.stdout.flush()
-            if show_progress:
-                sys.stderr.write("\r\033[K[*] scouting... %d/%d probes  |  %d misconfigured host(s) found"
-                                 % (done, total, len(announced)))
-                sys.stderr.flush()
+                    sys.stderr.write("[*] planning in batches of %d probe(s); checking "
+                                     "ports as each batch is reached ...\n" % _PLAN_BATCH)
+            live, closed = prune_closed_ports(batch, args.timeout, args.threads)
+            closed_total += closed
+            total += len(live)
+            del batch
+            if not args.quiet and batch_no == 0:
+                if single and closed_total:
+                    sys.stderr.write("[*] %d closed port(s) skipped  ·  %d/%d probes live\n"
+                                     % (closed_total, total, planned))
+                sys.stderr.write("[*] scouting exposed NTLM, please stand by ...\n")
+            futs = {ex.submit(probe, proto, host, port, url, None, args.timeout): (proto, host)
+                    for (proto, host, port, url) in live}
+            del live
+            for fut in concurrent.futures.as_completed(futs):
+                r = fut.result()
+                results.append(r)
+                done += 1
+                if args.quiet:
+                    continue
+                if args.verbose and not is_canary_result(r):
+                    # Full live detail: every endpoint / probe (the synthetic
+                    # canary path is internal plumbing, not a finding).
+                    if r.get("success"):
+                        print(fmt_text(r)); print()
+                    else:
+                        print(fmt_text(r))
+                elif (r.get("success") and r["host"] not in announced
+                      and (r.get("fingerprint") or r.get("internal_addresses"))):
+                    # Default: one concise line the first time a host is confirmed
+                    # (name-only cert hits don't warrant a live line).
+                    announced.add(r["host"])
+                    _clear_progress()
+                    print(host_line(r)); sys.stdout.flush()
+                if show_progress:
+                    sys.stderr.write("\r\033[K[*] scouting... %d/%s probes  |  %d misconfigured host(s) found"
+                                     % (done, total if single else "%d+" % total,
+                                        len(announced)))
+                    sys.stderr.flush()
+            futs.clear()
         _clear_progress()
+    if not args.quiet and not single and closed_total:
+        sys.stderr.write("[*] %d closed port(s) skipped  ·  %d/%d probes live\n"
+                         % (closed_total, total, planned))
 
+    # Fold site-wide NTLM auth (path-agnostic) down to one finding per host so
+    # the wordlist doesn't masquerade as dozens of distinct endpoints.
+    results = collapse_catchall_endpoints(results)
     roles = resolve_host_roles(results)
     # "Exposed NTLM" = endpoints that actually returned an NTLM challenge (not
     # cert names / internal IPs / headers leaked via an adjacent check).
