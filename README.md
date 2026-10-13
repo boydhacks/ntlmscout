@@ -24,6 +24,7 @@ Pure standard library. Single file. Python 3.7+. No dependencies.
 - **Interprets, not just dumps** — honest **member vs. Domain Controller** classification (a DC is only claimed when a DC service actually answers), and a security-posture read (SMB/LDAP signing, EPA/channel-binding, NTLMv1/LM weak crypto).
 - **Recovers the internal IP** — the one thing NTLM itself can't give you — via IIS Host-header disclosure (CVE-2000-0649), WebDAV PROPFIND, RPC `IOXIDResolver::ServerAlive2` (TCP 135), and TLS/RDP certificate IP SANs.
 - **Extra disclosures** — TLS/RDP certificate CN + SANs, Exchange `X-FEServer`/`X-CalculatedBETarget` header leaks, and anonymous **LDAP rootDSE** enrichment (naming contexts, `dnsHostName`, AD functional levels).
+- **No wordlist false positives** — random "canary" paths detect hosts that challenge *every* path (site-wide IIS Windows Auth, or an ADC / reverse proxy in front of the app) and collapse the wordlist noise to a single, honest finding. If every canary is dropped by a slow or throttling host the guard falls back on the wordlist hit ratio rather than failing open, and the report says which signal decided it.
 - **Fast** — a port-liveness gate skips every probe on a closed port, so filtered hosts don't cost you a wall of timeouts.
 - **Lockout-safe spray mode** — password-spray ordering (one password across all users per round), NTLM Type-3 or HTTP Basic against the most effective endpoint, with a clear valid / invalid / inconclusive verdict.
 - **Report-ready output** — grouped per-host summary plus JSON, NDJSON, CSV, and a NetExec-style hosts file. Output files are written with owner-only permissions.
@@ -37,6 +38,12 @@ python3 ntlmscout.py --help
 ```
 
 No `pip install`, no virtualenv — it only uses the Python standard library.
+
+## Tests
+
+```bash
+python3 -m unittest test_ntlmscout
+```
 
 ## Usage
 

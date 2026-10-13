@@ -588,14 +588,20 @@ def http_challenge(url, host_header=None, timeout=10):
 
 
 def http_probe(url, host_header=None, timeout=10):
-    """Return (ntlm_blob_or_None, {name_headers}, {info_headers})."""
+    """Return (ntlm_blob_or_None, {name_headers}, {info_headers}, responded).
+
+    ``responded`` is False only when the request never got an HTTP response at
+    all -- timeout, reset, TLS failure, rate-limit drop. A 401/404/200 without a
+    challenge *is* an answer and reports True. That distinction is what lets the
+    catch-all guard tell "this path is not protected" apart from "we never found
+    out", instead of treating both as proof the host is path-specific."""
     headers = _http_fetch(url, host_header, timeout)
-    if not headers:
-        return None, {}, {}
+    if headers is None:
+        return None, {}, {}, False
     blob = _ntlm_from_headers(headers)
     names = {k: headers.get(k) for k in _EXCHANGE_NAME_HDRS if headers.get(k)}
     info = {k: headers.get(k) for k in _EXCHANGE_INFO_HDRS if headers.get(k)}
-    return blob, names, info
+    return blob, names, info, True
 
 
 # ---- Line-based SASL: SMTP / IMAP / POP3 / NNTP ---------------------------
@@ -1171,6 +1177,40 @@ HTTP_PATHS = _normalize_paths(_HTTP_PATHS_RAW)
 
 
 # ---------------------------------------------------------------------------
+#  Catch-all (path-agnostic) NTLM detection
+#
+#  A site that enforces NTLM on *every* path -- an IIS site-wide Windows Auth
+#  filter, or an ADC / reverse proxy in front of the app -- answers the whole
+#  endpoint wordlist with a challenge, so the "discovered" endpoints are just
+#  the wordlist enumerating itself. We probe one random, cannot-exist path (a
+#  canary); if it also challenges, the host is a site-wide auth gate and its
+#  per-path hits are collapsed to a single, honest finding.
+# ---------------------------------------------------------------------------
+CANARY_MARKER = "/_ntlmscout_canary_"
+
+# More than one canary per endpoint: the guard should not hinge on a single
+# request surviving a host that is slow, throttling, or dropping connections
+# under the probe load.
+CANARY_PROBES = 2
+
+# Fallback for when every canary died. A host that challenges nearly every path
+# it actually answered is a site-wide gate whether or not the canary got through.
+# The sample floor keeps a two-hit host from collapsing on a 100% ratio.
+CATCHALL_MIN_SAMPLE = 10
+CATCHALL_HIT_RATIO = 0.9
+
+
+def canary_path():
+    """A random path that cannot correspond to a real application endpoint."""
+    return "{}{}/".format(CANARY_MARKER, uuid.uuid4().hex)
+
+
+def is_canary_result(result):
+    """True if this result came from the synthetic canary probe."""
+    return CANARY_MARKER in (result.get("url") or "")
+
+
+# ---------------------------------------------------------------------------
 #  Internal-address disclosure modules (passive; no auth / no relay)
 #
 #  The NTLM CHALLENGE never carries an IP, but two well-known unauthenticated
@@ -1600,6 +1640,11 @@ def probe(proto, host, port=None, url=None, host_header=None, timeout=10):
         return probe_tlscert(host, port or 3389, timeout, rdp=True)
     result = {"target": url or "{}:{}".format(host, port or ""), "protocol": proto,
               "host": host, "port": port, "url": url, "success": False}
+    if proto in ("http", "https"):
+        # Overwritten once the fetch returns; staying False means the probe
+        # never reached the server, which the catch-all guard treats as "no
+        # evidence" rather than as evidence of path-specific auth.
+        result["responded"] = False
     t0 = time.time()
     try:
         exch_names, exch_info = {}, {}
@@ -1607,7 +1652,8 @@ def probe(proto, host, port=None, url=None, host_header=None, timeout=10):
             if not url:
                 p = port or (443 if proto == "https" else 80)
                 url = "{}://{}:{}/".format(proto, _url_host(host), p)
-            raw, exch_names, exch_info = http_probe(url, host_header, timeout)
+            raw, exch_names, exch_info, responded = http_probe(url, host_header, timeout)
+            result["responded"] = responded
         else:
             raw = run_protocol(proto, host, port, url, host_header, timeout)
         if not raw:
@@ -1830,6 +1876,26 @@ def plan_targets(args):
             for p, proto in sorted(PORT_PROTOCOL.items()):
                 _add_host(jobs, proto, host, p, args)
 
+    # One canary per discovered HTTP(S) endpoint: a random path that cannot
+    # exist. If it returns an NTLM challenge, the host challenges every path
+    # (see collapse_catchall_endpoints). WinRM is a single-path service, so the
+    # wordlist -- and the canary -- don't apply.
+    if discover:
+        canary_seen = set()
+        for (proto, host, port, url) in list(jobs):
+            if proto not in ("http", "https") or not url:
+                continue
+            if _job_port(proto, port) in _WINRM_PORTS:
+                continue
+            key = (proto, host, _job_port(proto, port))
+            if key in canary_seen:
+                continue
+            canary_seen.add(key)
+            scheme, rest = url.split("://", 1)
+            origin = "{}://{}".format(scheme, rest.split("/", 1)[0])
+            for _ in range(CANARY_PROBES):
+                jobs.append((proto, host, port, origin + canary_path()))
+
     # Internal-disclosure jobs (on by default):
     #   * iisip   : one per unique http(s) endpoint (Host-header + PROPFIND)
     #   * tlscert : one per unique TLS endpoint (cert CN/SAN names + IPs)
@@ -2000,6 +2066,101 @@ def _fp_score(r):
     return len([v for v in r.get("fingerprint", {}).values() if v not in (None, "")])
 
 
+def _endpoint_key(r):
+    """(protocol, host, port) identity for an endpoint, with defaults resolved."""
+    return (r.get("protocol"), r.get("host"), _job_port(r.get("protocol"), r.get("port")))
+
+
+def _url_path(url):
+    """Path portion of a URL ('/' when there is none)."""
+    rest = url.split("://", 1)[-1]
+    return rest[rest.find("/"):] if "/" in rest else "/"
+
+
+def _catchall_representative(rs):
+    """The single endpoint to keep for a catch-all host: the site root when
+    present, otherwise the richest fingerprint, otherwise the first."""
+    for r in rs:
+        if _url_path(r.get("url") or "") == "/":
+            return r
+    return max(rs, key=_fp_score)
+
+
+def _canary_verdict(canaries):
+    """What this endpoint's canary probes actually proved.
+
+    ``catchall`` -- a canary was challenged on a path that cannot exist.
+    ``specific`` -- a canary reached the server and was not challenged, so auth
+                    really is per-path.
+    ``unknown``  -- every canary failed to reach the server, so the guard learned
+                    nothing. Treating that as ``specific`` is what made a single
+                    timed-out request silently re-expose the whole wordlist.
+    """
+    reached = False
+    for r in canaries:
+        if r.get("ntlm"):
+            return "catchall"
+        if r.get("responded", True):
+            reached = True
+    return "specific" if reached else "unknown"
+
+
+def collapse_catchall_endpoints(results):
+    """Collapse site-wide (path-agnostic) NTLM auth to one endpoint per host.
+
+    A canary probe that returns an NTLM challenge proves the host challenges
+    every path, so its wordlist hits are false positives. When every canary for
+    an endpoint failed to reach the server the verdict is ``unknown``, and the
+    hit ratio over the paths that *did* answer decides instead -- otherwise one
+    dropped request silently re-exposes the whole wordlist as findings.
+
+    The canary results are dropped; for each affected (protocol, host, port)
+    group one representative keeps its challenge (tagged ``catchall``, plus
+    ``catchall_inferred`` when the ratio decided it) while the rest stay in the
+    list for their disclosed names / addresses but no longer count as endpoints.
+
+    Mutates ``results`` in place and returns the filtered list.
+    """
+    canaries, answered, hits = {}, {}, {}
+    out, groups = [], OrderedDict()
+    for r in results:
+        key = _endpoint_key(r)
+        if is_canary_result(r):
+            canaries.setdefault(key, []).append(r)
+            continue                   # synthetic path -- never an endpoint
+        out.append(r)
+        if r.get("protocol") not in ("http", "https"):
+            continue
+        if r.get("responded", True):
+            answered[key] = answered.get(key, 0) + 1
+            if r.get("ntlm"):
+                hits[key] = hits.get(key, 0) + 1
+        if r.get("ntlm"):
+            groups.setdefault(key, []).append(r)
+
+    for key, rs in groups.items():
+        verdict = _canary_verdict(canaries.get(key, []))
+        inferred = False
+        if verdict == "unknown":
+            # No canary survived. Fall back on the shape of the wordlist run
+            # itself, which costs no extra request and cannot time out.
+            n = answered.get(key, 0)
+            if n >= CATCHALL_MIN_SAMPLE and hits.get(key, 0) >= n * CATCHALL_HIT_RATIO:
+                verdict, inferred = "catchall", True
+        if verdict != "catchall":
+            continue
+        rep = _catchall_representative(rs)
+        for r in rs:
+            r["catchall"] = True
+            if inferred:
+                r["catchall_inferred"] = True
+            if r is rep:
+                r["catchall_collapsed"] = len(rs)
+            else:
+                r["ntlm"] = None
+    return out
+
+
 def print_host_summaries(results, roles=None, out=sys.stdout, full=False):
     """Per-host summary block.
 
@@ -2096,6 +2257,18 @@ def print_host_summaries(results, roles=None, out=sys.stdout, full=False):
             out.write(_color(row, C_RED, use_color) + "\n")
             for e in eps:
                 out.write("      - {}\n".format(e))
+            if any(r.get("catchall") for r in rs):
+                n = max((r.get("catchall_collapsed") or 0)
+                        for r in rs if r.get("catchall"))
+                # Say which signal decided it: a canary that came back, or the
+                # hit ratio standing in because none of them did.
+                basis = ("inferred from hit ratio, canary unreachable"
+                         if any(r.get("catchall_inferred") for r in rs)
+                         else "canary confirmed")
+                out.write(_color(
+                    "      (site-wide NTLM auth -- path-agnostic; {} wordlist "
+                    "path(s) collapsed; {})".format(n, basis),
+                    C_YELLOW, use_color) + "\n")
     out.write("=" * 72 + "\n")
 
 
@@ -2660,8 +2833,9 @@ def run_recon(args):
             done += 1
             if args.quiet:
                 continue
-            if args.verbose:
-                # Full live detail: every endpoint / probe.
+            if args.verbose and not is_canary_result(r):
+                # Full live detail: every endpoint / probe (the synthetic
+                # canary path is internal plumbing, not a finding).
                 if r.get("success"):
                     print(fmt_text(r)); print()
                 else:
@@ -2679,6 +2853,9 @@ def run_recon(args):
                 sys.stderr.flush()
         _clear_progress()
 
+    # Fold site-wide NTLM auth (path-agnostic) down to one finding per host so
+    # the wordlist doesn't masquerade as dozens of distinct endpoints.
+    results = collapse_catchall_endpoints(results)
     roles = resolve_host_roles(results)
     # "Exposed NTLM" = endpoints that actually returned an NTLM challenge (not
     # cert names / internal IPs / headers leaked via an adjacent check).
