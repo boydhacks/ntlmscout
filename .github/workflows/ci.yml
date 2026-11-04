@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # The README promises Python 3.7+. Builds of these end-of-life
+          # versions are only published for older runner images.
+          - os: ubuntu-22.04
+            python-version: "3.7"
+          - os: ubuntu-22.04
+            python-version: "3.8"
+          - os: ubuntu-22.04
+            python-version: "3.9"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile
+        run: python -m py_compile ntlmscout.py
+
+      - name: CLI smoke test
+        run: python ntlmscout.py --help > /dev/null
+
+      - name: Unit tests
+        run: |
+          if compgen -G "test_*.py" > /dev/null; then
+            python -m unittest discover -v -p "test_*.py"
+          else
+            echo "No test_*.py files yet; skipping."
+          fi
